@@ -221,20 +221,17 @@ void server_mode(const char *directory) {
 
     printf("Server listening on port %d\n", PORT);
 
-    while (1) {
-        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_size);
-        if (client_sock < 0) {
-            perror("accept");
-            exit(1);
-        }
-
-        printf("Client connected: %s\n", inet_ntoa(client_addr.sin_addr));
-
-        process_client_request(client_sock, directory);
-
-        close(client_sock);
+    client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_size);
+    if (client_sock < 0) {
+        perror("accept");
+        exit(1);
     }
 
+    printf("Client connected: %s\n", inet_ntoa(client_addr.sin_addr));
+
+    process_client_request(client_sock, directory);
+
+    close(client_sock);
     close(server_sock);
 }
 
