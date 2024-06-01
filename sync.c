@@ -7,13 +7,11 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <dirent.h>
 
 #define PORT 8889
 #define BUFFER_SIZE 1024
-#define MAX_FILES 100
 #define MAX_FILENAME 256
-#define MAX_FILESIZE 1024 * 1024 * 10 // 10 MB
+#define MAX_FILES 1000
 
 typedef struct {
     char filename[MAX_FILENAME];
@@ -21,71 +19,101 @@ typedef struct {
     size_t size;
 } FileInfo;
 
+void server_mode(const char *directory);
+void client_mode(const char *directory, const char *server_ip);
+void sync_files(int sock, const char *directory);
+void process_client_request(int client_sock, const char *directory);
+void send_file(int sock, const char *directory, const char *filename);
+void receive_file(int sock, const char *directory, const char *filename, size_t filesize);
+void send_delete(int sock, const char *filename);
+void delete_file(const char *directory, const char *filename);
 
-void send_file(int sock, const char *directory, const char *filename) {
-    char filepath[MAX_FILENAME];
-    snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename);
-
-    FILE *fp = fopen(filepath, "rb");
-    if (fp == NULL) {
-        perror("fopen");
-        return;
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <directory> [server_ip]\n", argv[0]);
+        exit(1);
     }
 
-    fseek(fp, 0, SEEK_END);
-    size_t filesize = ftell(fp);
-    rewind(fp);
-
-    char buffer[BUFFER_SIZE];
-    snprintf(buffer, sizeof(buffer), "SEND_FILE %s %zu", filename, filesize);
-    send(sock, buffer, strlen(buffer), 0);
-
-    while (!feof(fp)) {
-        size_t bytes_read = fread(buffer, 1, BUFFER_SIZE, fp);
-        send(sock, buffer, bytes_read, 0);
+    if (argc == 2) {
+        server_mode(argv[1]);
+    } else {
+        client_mode(argv[1], argv[2]);
     }
 
-    fclose(fp);
+    return 0;
 }
 
-void receive_file(int sock, const char *directory, const char *filename, size_t filesize) {
-    char filepath[MAX_FILENAME];
-    snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename);
+void server_mode(const char *directory) {
+    int server_sock, client_sock;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addr_size = sizeof(client_addr);
 
-    FILE *fp = fopen(filepath, "wb");
-    if (fp == NULL) {
-        perror("fopen");
-        return;
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("socket");
+        exit(1);
     }
 
-    char buffer[BUFFER_SIZE];
-    size_t bytes_received = 0;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    while (bytes_received < filesize) {
-        ssize_t bytes_read = recv(sock, buffer, BUFFER_SIZE, 0);
-        if (bytes_read <= 0) {
-            break;
-        }
-        fwrite(buffer, 1, bytes_read, fp);
-        bytes_received += bytes_read;
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        exit(1);
     }
 
-    fclose(fp);
+    if (listen(server_sock, 1) < 0) {
+        perror("listen");
+        exit(1);
+    }
+
+    printf("Server listening on port %d\n", PORT);
+
+    client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_size);
+    if (client_sock < 0) {
+        perror("accept");
+        exit(1);
+    }
+
+    printf("Client connected: %s\n", inet_ntoa(client_addr.sin_addr));
+
+    process_client_request(client_sock, directory);
+
+    close(client_sock);
+    close(server_sock);
 }
 
-void send_delete(int sock, const char *filename) {
-    char buffer[BUFFER_SIZE];
-    snprintf(buffer, sizeof(buffer), "DELETE_FILE %s", filename);
-    send(sock, buffer, strlen(buffer), 0);
+void client_mode(const char *directory, const char *server_ip) {
+    int sock;
+    struct sockaddr_in server_addr;
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        exit(1);
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        perror("inet_pton");
+        exit(1);
+    }
+
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        exit(1);
+    }
+
+    printf("Connected to server: %s\n", server_ip);
+
+    sync_files(sock, directory);
+
+    close(sock);
 }
-
-void delete_file(const char *directory, const char *filename) {
-    char filepath[MAX_FILENAME];
-    snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename);
-    remove(filepath);
-}
-
-
 
 void sync_files(int sock, const char *directory) {
     DIR *dir;
@@ -165,6 +193,9 @@ void sync_files(int sock, const char *directory) {
                 local_files[i].last_modified, local_files[i].size);
     }
     fclose(fp);
+
+    // Enviar confirmación de finalización al servidor
+    send(sock, "SYNC_COMPLETE", 13, 0);
 }
 
 void process_client_request(int client_sock, const char *directory) {
@@ -179,104 +210,94 @@ void process_client_request(int client_sock, const char *directory) {
             char filename[MAX_FILENAME];
             size_t filesize;
             sscanf(buffer, "SEND_FILE %s %zu", filename, &filesize);
+            send(client_sock, "READY", 5, 0); // Enviar confirmación al cliente
             receive_file(client_sock, directory, filename, filesize);
         } else if (strncmp(buffer, "DELETE_FILE", 11) == 0) {
             // El cliente está solicitando eliminar un archivo
             char filename[MAX_FILENAME];
             sscanf(buffer, "DELETE_FILE %s", filename);
             delete_file(directory, filename);
+        } else if (strncmp(buffer, "SYNC_COMPLETE", 13) == 0) {
+            // El cliente ha terminado la sincronización
+            break;
+        }
+    }
+}
+
+void send_file(int sock, const char *directory, const char *filename) {
+    char filepath[MAX_FILENAME];
+    snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename);
+
+    FILE *fp = fopen(filepath, "rb");
+    if (fp == NULL) {
+        perror("fopen");
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    size_t filesize = ftell(fp);
+    rewind(fp);
+
+    char buffer[BUFFER_SIZE];
+    snprintf(buffer, sizeof(buffer), "SEND_FILE %s %zu", filename, filesize);
+    send(sock, buffer, strlen(buffer), 0);
+
+    // Esperar confirmación del servidor antes de enviar el archivo
+    recv(sock, buffer, BUFFER_SIZE, 0);
+
+    while (!feof(fp)) {
+        size_t bytes_read = fread(buffer, 1, BUFFER_SIZE, fp);
+        send(sock, buffer, bytes_read, 0);
+    }
+
+    fclose(fp);
+}
+
+void receive_file(int sock, const char *directory, const char *filename, size_t filesize) {
+    char filepath[MAX_FILENAME];
+    snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename);
+
+    // Verificar si el archivo ya existe
+    if (access(filepath, F_OK) == 0) {
+        // El archivo existe, renombrarlo agregando un sufijo de conflicto
+        char conflict_filepath[MAX_FILENAME];
+        snprintf(conflict_filepath, sizeof(conflict_filepath), "%s.conflicto", filepath);
+        if (rename(filepath, conflict_filepath) != 0) {
+            perror("rename");
+            return;
         }
     }
 
-    // Enviar confirmación de finalización al cliente
-    send(client_sock, "SYNC_COMPLETE", 13, 0);
+    FILE *fp = fopen(filepath, "wb");
+    if (fp == NULL) {
+        perror("fopen");
+        return;
+    }
+
+    char buffer[BUFFER_SIZE];
+    size_t bytes_received = 0;
+
+    while (bytes_received < filesize) {
+        ssize_t bytes_read = recv(sock, buffer, BUFFER_SIZE, 0);
+        if (bytes_read <= 0) {
+            perror("recv");
+            break;
+        }
+        fwrite(buffer, 1, bytes_read, fp);
+        bytes_received += bytes_read;
+    }
+
+    fclose(fp);
 }
 
-
-void server_mode(const char *directory) {
-    int server_sock, client_sock;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_size = sizeof(client_addr);
-
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        perror("socket");
-        exit(1);
-    }
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
-        exit(1);
-    }
-
-    if (listen(server_sock, 1) < 0) {
-        perror("listen");
-        exit(1);
-    }
-
-    printf("Server listening on port %d\n", PORT);
-
-    client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_size);
-    if (client_sock < 0) {
-        perror("accept");
-        exit(1);
-    }
-
-    printf("Client connected: %s\n", inet_ntoa(client_addr.sin_addr));
-
-    process_client_request(client_sock, directory);
-
-    close(client_sock);
-    close(server_sock);
+void send_delete(int sock, const char *filename) {
+    char buffer[BUFFER_SIZE];
+    snprintf(buffer, sizeof(buffer), "DELETE_FILE %s", filename);
+    send(sock, buffer, strlen(buffer), 0);
 }
 
-void client_mode(const char *directory, const char *server_ip) {
-    int sock;
-    struct sockaddr_in server_addr;
-
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        exit(1);
-    }
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
-        perror("inet_pton");
-        exit(1);
-    }
-
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
-        exit(1);
-    }
-
-    printf("Connected to server: %s\n", server_ip);
-
-    sync_files(sock, directory);
-
-    close(sock);
-}
-
-
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <directory> [server_ip]\n", argv[0]);
-        exit(1);
-    }
-
-    if (argc == 2) {
-        server_mode(argv[1]);
-    } else {
-        client_mode(argv[1], argv[2]);
-    }
-
-    return 0;
+void delete_file(const char *directory, const char *filename) {
+    char filepath[MAX_FILENAME];
+    snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename);
+    remove(filepath);
 }
